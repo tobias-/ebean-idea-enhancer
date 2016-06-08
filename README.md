@@ -1,2 +1,2 @@
 # ebean-idea-enhancer
-IntelliJ IDEA plugin to perform EbeanORM Enhancement
+Test for above that show problem
