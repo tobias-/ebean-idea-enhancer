@@ -20,14 +20,18 @@
 package org.avaje.idea.ebean10.plugin;
 
 import io.ebean.enhance.agent.ClassBytesReader;
+
 import com.intellij.openapi.compiler.CompileContext;
 import com.intellij.openapi.compiler.CompilerMessageCategory;
 import com.intellij.openapi.module.Module;
 import com.intellij.openapi.project.IndexNotReadyException;
+import com.intellij.openapi.roots.ProjectFileIndex;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.JavaPsiFacade;
 import com.intellij.psi.PsiClass;
 import com.intellij.psi.search.GlobalSearchScope;
+import net.jcip.annotations.NotThreadSafe;
+import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -40,14 +44,21 @@ import java.util.Map;
  * @author Mario Ivankovits, mario@ops.co.at
  * @author yevgenyk - Updated 28/04/2014 for IDEA 13
  */
+@NotThreadSafe
 public class IdeaClassBytesReader implements ClassBytesReader {
 
   private final CompileContext compileContext;
   private final Map<String, File> compiledClasses;
+  private final JavaPsiFacade psiFacade;
+  private final GlobalSearchScope globalSearchScope;
+  private GlobalSearchScope searchScope;
 
   public IdeaClassBytesReader(CompileContext compileContext, Map<String, File> compiledClasses) {
     this.compileContext = compileContext;
     this.compiledClasses = compiledClasses;
+    globalSearchScope = GlobalSearchScope.allScope(compileContext.getProject());
+    this.searchScope = GlobalSearchScope.allScope(compileContext.getProject());
+    this.psiFacade = JavaPsiFacade.getInstance(compileContext.getProject());
   }
 
   @Override
@@ -75,11 +86,9 @@ public class IdeaClassBytesReader implements ClassBytesReader {
 
   private byte[] lookupClassBytesFallback(String classNamePath) {
     // Create a Psi compatible className
-    final String className = classNamePath.replace('/', '.').replace('$', '.');
+    final String className = convertToClassNamePath(classNamePath);
     try {
 
-      final JavaPsiFacade psiFacade = JavaPsiFacade.getInstance(compileContext.getProject());
-      final GlobalSearchScope searchScope = GlobalSearchScope.allScope(compileContext.getProject());
       final PsiClass psiClass = psiFacade.findClass(className, searchScope);
       if (psiClass == null) {
         warn("Couldn't find PsiClass for class: " + className);
@@ -92,7 +101,7 @@ public class IdeaClassBytesReader implements ClassBytesReader {
         return null;
       }
 
-      final VirtualFile classFile = getClassFile(containingFile, classNamePath);
+      final VirtualFile classFile = getClassFileRelativeContainingFile(containingFile, classNamePath, psiClass, className);
       if (classFile == null) {
         warn("Couldn't find .class file for class: " + className);
         return null;
@@ -111,59 +120,46 @@ public class IdeaClassBytesReader implements ClassBytesReader {
     }
   }
 
-  private VirtualFile getClassFile(VirtualFile containingFile, String classNamePath) {
-    final Module module = compileContext.getModuleByFile(containingFile);
-    if (module == null) {
-      // File is not linked to a project module - probably from a 3rd party .jar
+  private VirtualFile getClassFileRelativeContainingFile(VirtualFile containingFile, String classNamePath, PsiClass psiClass, String className) {
+    ProjectFileIndex projectFileIndex = ProjectFileIndex.getInstance(psiClass.getProject());
+    VirtualFile classRootForFile = projectFileIndex.getClassRootForFile(containingFile);
+    if (classRootForFile == null) {
+      warn("Couldn't find class root '" + className + "' in project file index.");
       return containingFile;
     }
-
-    final VirtualFile classFile = getClassFileFromModule(module, classNamePath);
-    if (classFile == null) {
-      warn(module.getName() + ": Couldn't find compiled file for class: " + classNamePath);
+    VirtualFile fileByRelativePath = classRootForFile.findFileByRelativePath(classNamePath + ".class");
+    if (fileByRelativePath == null) {
+      warn("Couldn't find file for class '" + className + "' in project file index.");
       return containingFile;
     }
-    return classFile;
-  }
-
-  private VirtualFile getClassFileFromModule(Module module, String classNamePath) {
-    final String classNamePathWithExtension = classNamePath + ".class";
-
-    // Search the file in the module's main output directory.
-    final VirtualFile requiredFile = getClassFileFromModuleMainOutput(module, classNamePathWithExtension);
-    if (requiredFile != null) {
-      return requiredFile;
-    }
-
-    // File is not in the module's main output directory.
-    // Search the file in the module's test output directory.
-    return getClassFileFromModuleTestOutput(module, classNamePathWithExtension);
-  }
-
-  private VirtualFile getClassFileFromModuleMainOutput(Module module, String classNamePathWithExtension) {
-    // Search the file in the module's main output directory.
-    final VirtualFile outputDirectory = compileContext.getModuleOutputDirectory(module);
-    if (outputDirectory == null) {
-      warn(module.getName() + ": Couldn't find main output directory!");
-      return null;
-    }
-
-    return outputDirectory.findFileByRelativePath(classNamePathWithExtension);
-  }
-
-  private VirtualFile getClassFileFromModuleTestOutput(Module module, String classNamePathWithExtension) {
-    // Search the file in the module's test output directory.
-    final VirtualFile outputDirectory = compileContext.getModuleOutputDirectoryForTests(module);
-    if (outputDirectory == null) {
-      warn(module.getName() + ": Couldn't find test output directory!");
-      return null;
-    }
-
-    return outputDirectory.findFileByRelativePath(classNamePathWithExtension);
+    return fileByRelativePath;
   }
 
   private void warn(String message) {
     // warning level messages not showing in Messages so using INFORMATION here
     compileContext.addMessage(CompilerMessageCategory.INFORMATION, "WARN: " + message, null, -1, -1);
+  }
+
+  void setSearchScopeFromClassName(final String className) {
+    if (className == null) {
+      this.searchScope = globalSearchScope;
+      return;
+    }
+
+    final String classNamePath = convertToClassNamePath(className);
+    final PsiClass aClass = psiFacade.findClass(classNamePath, globalSearchScope);
+    if (aClass == null) {
+      warn("Couldn't find PsiClass for class: " + className);
+      return;
+    }
+
+    VirtualFile containingFile = aClass.getContainingFile().getVirtualFile();
+    Module module = compileContext.getModuleByFile(containingFile);
+    this.searchScope = module.getModuleWithDependenciesAndLibrariesScope(true);
+  }
+
+  @NotNull
+  private String convertToClassNamePath(final String className) {
+    return className.replace('/', '.').replace('$', '.');
   }
 }
